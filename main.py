@@ -22,7 +22,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
-import anthropic
+
 
 # ── optional faster-whisper ────────────────────────────────────────────
 try:
