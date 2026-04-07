@@ -271,7 +271,14 @@ def synthesize_speech(text: str, voice_id: str) -> bytes:
     payload = {
         "model_id":   CARTESIA_MODEL,
         "transcript": text,
-        "voice":      {"mode": "id", "id": voice_id},
+        "voice":      {
+            "mode": "id", 
+            "id": voice_id,
+            "__experimental_controls": {
+                "speed": "slow",      # Options: "slowest", "slow", "normal", "fast", "fastest"
+                "emotion": []
+            }
+        },
         "output_format": {
             "container":   "wav",
             "encoding":    "pcm_s16le",
