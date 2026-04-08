@@ -2,7 +2,7 @@
 Telecaller Training API — FastAPI Backend
 Deploy on Railway/Render/Fly.io (NOT Vercel — needs persistent audio processing)
 
-pip install fastapi uvicorn python-multipart anthropic groq cartesia requests numpy soundfile
+pip install fastapi uvicorn python-multipart anthropic groq cartesia requests numpy soundfile scipy
 """
 
 import os
@@ -23,6 +23,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 
+# For phone line audio effects
+try:
+    from scipy import signal
+    from scipy.io import wavfile
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 # ── optional faster-whisper ────────────────────────────────────────────
 try:
@@ -49,7 +56,7 @@ PLAYBACK_RATE     = 22050
 SESSIONS: dict[str, dict] = {}
 
 # ══════════════════════════════════════════════════════════════════════
-# CUSTOMER PROFILES
+# CUSTOMER PROFILES - UPDATED FOR MORE NATURAL RESPONSES
 # ══════════════════════════════════════════════════════════════════════
 
 CUSTOMER_PROFILES = [
@@ -62,13 +69,15 @@ CUSTOMER_PROFILES = [
             "You are Robert, a real person who just got a cold call you weren't expecting.\n\n"
             "ABSOLUTE RULES:\n"
             "- Output ONLY the words you speak aloud. Nothing else.\n"
-            "- Keep replies SHORT (3-10 words). Real phone replies aren't speeches.\n"
+            "- Keep replies conversational (typically 5-15 words). Vary your length naturally.\n"
+            "- Sometimes be brief (3-5 words), sometimes more elaborate (10-15 words).\n"
             "- NO asterisks, NO narration, NO stage directions.\n"
-            "- Opening: 'Yeah?' or 'Hello?' or 'Who's this?'\n"
-            "- When they pitch: 'What are you selling?' Cut in.\n"
-            "- If vague/long-winded, interrupt: 'Just get to the point.'\n"
-            "- If they make sense, ask one short question. One.\n"
-            "- American English. No filler compliments.\n"
+            "- Opening: 'Yeah?' or 'Hello, who's this?' or 'Robert Chen speaking.'\n"
+            "- When they pitch: 'Okay, what exactly are you selling?' or 'I'm kind of in the middle of something here.'\n"
+            "- If vague/long-winded: 'Can you just get to the point? I don't have a lot of time.'\n"
+            "- If they make sense, respond with realistic questions or concerns.\n"
+            "- American English. Sound like a real busy professional on the phone.\n"
+            "- Use natural speech patterns: 'uh', 'hmm', 'well', 'I mean', occasionally.\n"
         )
     },
     {
@@ -80,12 +89,14 @@ CUSTOMER_PROFILES = [
             "You are Sarah, busy person who picked up an unknown number by mistake.\n\n"
             "ABSOLUTE RULES:\n"
             "- Output ONLY what you say aloud. Nothing else.\n"
-            "- One sentence or less. You're busy.\n"
+            "- Vary your responses (5-12 words typically). You're distracted.\n"
             "- NO asterisks, NO narration.\n"
-            "- Opening: 'Hello?' or 'Yeah, who's this?'\n"
-            "- If they take too long: 'Okay what are you selling?'\n"
-            "- Trail off: 'Sorry— what?'\n"
-            "- To hang up: 'okay I gotta go' then stop.\n"
+            "- Opening: 'Hello?' or 'Yeah, who is this?'\n"
+            "- If they take too long: 'Sorry, what company did you say this was?'\n"
+            "- Show distraction: 'Hold on— sorry, what were you saying?'\n"
+            "- To end: 'You know what, I really can't talk right now' then stop.\n"
+            "- Use filler words naturally: 'um', 'uh', 'like', 'sorry'.\n"
+            "- Sound harried and multitasking.\n"
         )
     },
     {
@@ -94,15 +105,16 @@ CUSTOMER_PROFILES = [
         "gender": "male",
         "description": "Blunt 40-year-old, everything is about the price",
         "system_prompt": (
-            "You are Mike. You only care about price.\n\n"
+            "You are Mike. You only care about price and value.\n\n"
             "ABSOLUTE RULES:\n"
             "- Output ONLY what you say aloud. Nothing else.\n"
-            "- SHORT. You interrogate.\n"
+            "- Mix short and medium responses (4-12 words). Be direct but not robotic.\n"
             "- NO asterisks, NO narration.\n"
-            "- Opening: 'Yeah?'\n"
-            "- First real question: 'How much?' Two words.\n"
-            "- If they dodge price: 'Okay but what's the monthly?'\n"
-            "- Compare bluntly: 'I got a lower quote somewhere else.'\n"
+            "- Opening: 'Yeah, what's this about?'\n"
+            "- First real question: 'Okay, so how much are we talking per month?'\n"
+            "- If they dodge price: 'Yeah but what's the actual monthly cost? Just give me a number.'\n"
+            "- Compare bluntly: 'I've seen better rates online. Why should I go with you?'\n"
+            "- Use natural emphasis: 'Look', 'Listen', 'Here's the thing'.\n"
         )
     },
     {
@@ -114,12 +126,13 @@ CUSTOMER_PROFILES = [
             "You are Dorothy, an elderly woman who picked up unsure who was calling.\n\n"
             "ABSOLUTE RULES:\n"
             "- Output ONLY what you say aloud. Nothing else.\n"
-            "- SHORT and natural. No speeches.\n"
+            "- Longer responses are okay (8-18 words). You process slowly.\n"
             "- NO asterisks, NO narration.\n"
-            "- Opening: 'Hello?' or 'Who's calling please?'\n"
-            "- Mishear: 'Sorry, what was that?' or 'Come again, honey?'\n"
-            "- Decisions need family: 'I'd have to talk to my son about that.'\n"
-            "- Warm Southern American English. Slow.\n"
+            "- Opening: 'Hello? Who's calling please?' or 'Yes, this is Dorothy.'\n"
+            "- Mishear: 'I'm sorry dear, could you repeat that?' or 'Come again, honey? I didn't quite catch that.'\n"
+            "- Decisions need family: 'Oh, I'd really need to talk to my son about something like that.'\n"
+            "- Warm Southern American English. Use 'dear', 'honey', 'oh my'.\n"
+            "- Sound genuinely sweet but confused.\n"
         )
     },
     {
@@ -131,12 +144,13 @@ CUSTOMER_PROFILES = [
             "You are James, already suspicious it's a sales call.\n\n"
             "ABSOLUTE RULES:\n"
             "- Output ONLY what you say aloud. Nothing else.\n"
-            "- SHORT. You don't chat.\n"
+            "- Short to medium (4-10 words). You don't waste time.\n"
             "- NO asterisks, NO narration.\n"
-            "- Opening: 'Yeah.' or 'Who's this?'\n"
-            "- Long intro: 'What do you want?'\n"
-            "- Direct question: 'Is this a sales call?'\n"
-            "- If not clear fast: 'Not interested.' Then stop.\n"
+            "- Opening: 'Yeah, who is this?' or 'What do you want?'\n"
+            "- Long intro: 'Is this a sales call? Because I'm not interested.'\n"
+            "- Direct challenge: 'Look, I'm on the Do Not Call list. How'd you get this number?'\n"
+            "- If not clear fast: 'Not interested. Don't call again.' Then stop.\n"
+            "- Gruff but realistic. Use 'Look', 'Listen pal'.\n"
         )
     },
     {
@@ -148,20 +162,21 @@ CUSTOMER_PROFILES = [
             "You are Emily, picked up an unknown number on a whim.\n\n"
             "ABSOLUTE RULES:\n"
             "- Output ONLY what you say aloud. Nothing else.\n"
-            "- SHORT and conversational. One or two sentences max.\n"
+            "- Conversational length (6-15 words). Sound smart and aware.\n"
             "- NO asterisks, NO narration.\n"
-            "- Opening: 'Hello?' or 'Yeah, hi?'\n"
-            "- Sense a script: 'Wait, is this a sales thing?'\n"
-            "- Robotic: 'Are you reading off something right now?'\n"
-            "- If genuine, ask a real short question back.\n"
+            "- Opening: 'Hello?' or 'Yeah, hi, who's this?'\n"
+            "- Sense a script: 'Wait, sorry— are you reading from a script right now?'\n"
+            "- If robotic: 'Okay, I'm gonna be honest, this sounds really rehearsed.'\n"
+            "- If genuine: Ask thoughtful questions. Be engaged but skeptical.\n"
+            "- Use casual speech: 'like', 'honestly', 'I mean', 'wait'.\n"
         )
     },
 ]
 
 DIFFICULTY_CONFIGS = {
-    "beginner":     {"label": "Beginner",     "emoji": "🟢", "guidance": "Be cooperative. Raise only 1 soft objection then warm up. Hint toward what they should say."},
-    "intermediate": {"label": "Intermediate", "emoji": "🟡", "guidance": "Be moderately skeptical. Raise 2-3 realistic objections. Make them work for the sale."},
-    "advanced":     {"label": "Advanced",     "emoji": "🔴", "guidance": "Be very difficult. Multiple strong objections. Only excellent pitches move you."},
+    "beginner":     {"label": "Beginner",     "emoji": "🟢", "guidance": "Be cooperative and friendly. Raise only 1 soft concern then warm up quickly. Give them hints about what to say next. Keep responses encouraging."},
+    "intermediate": {"label": "Intermediate", "emoji": "🟡", "guidance": "Be moderately skeptical. Raise 2-3 realistic objections. Make them work for it but be fair. Respond naturally to good handling."},
+    "advanced":     {"label": "Advanced",     "emoji": "🔴", "guidance": "Be very difficult. Multiple strong objections. Interrupt if they ramble. Only excellent technique moves you forward. Push back hard."},
 }
 
 EVALUATION_RUBRIC = {
@@ -246,6 +261,79 @@ def pick_voice(gender: str) -> str:
     return random.choice(pool) if pool else "a0e99841-438c-4a64-b679-ae501e7d6091"
 
 # ══════════════════════════════════════════════════════════════════════
+# PHONE LINE AUDIO EFFECTS
+# ══════════════════════════════════════════════════════════════════════
+
+def add_phone_line_effects(audio_bytes: bytes, sample_rate: int = 22050) -> bytes:
+    """
+    Add realistic phone line audio effects:
+    - Bandpass filter (300Hz - 3400Hz typical phone line)
+    - Light compression
+    - Background static noise
+    - Slight distortion
+    """
+    if not SCIPY_AVAILABLE:
+        # If scipy not available, return original audio
+        return audio_bytes
+    
+    try:
+        # Parse WAV file
+        audio_io = io.BytesIO(audio_bytes)
+        rate, data = wavfile.read(audio_io)
+        
+        # Convert to float for processing
+        if data.dtype == np.int16:
+            audio_float = data.astype(np.float32) / 32768.0
+        else:
+            audio_float = data.astype(np.float32)
+        
+        # 1. Bandpass filter (300Hz - 3400Hz - typical phone bandwidth)
+        nyquist = rate / 2
+        low = 300 / nyquist
+        high = 3400 / nyquist
+        b, a = signal.butter(4, [low, high], btype='band')
+        filtered = signal.filtfilt(b, a, audio_float)
+        
+        # 2. Add very light static noise (subtle)
+        noise_level = 0.002  # Very subtle
+        noise = np.random.normal(0, noise_level, len(filtered))
+        with_noise = filtered + noise
+        
+        # 3. Add occasional light crackle (sparse)
+        if random.random() < 0.3:  # 30% chance of light crackle
+            crackle_positions = np.random.choice(len(with_noise), size=int(len(with_noise) * 0.001), replace=False)
+            for pos in crackle_positions:
+                if pos < len(with_noise):
+                    with_noise[pos] += random.uniform(-0.01, 0.01)
+        
+        # 4. Light compression (make quieter parts slightly louder)
+        threshold = 0.3
+        ratio = 3.0
+        compressed = np.where(
+            np.abs(with_noise) > threshold,
+            np.sign(with_noise) * (threshold + (np.abs(with_noise) - threshold) / ratio),
+            with_noise
+        )
+        
+        # 5. Normalize to prevent clipping
+        max_val = np.max(np.abs(compressed))
+        if max_val > 0:
+            compressed = compressed * 0.95 / max_val
+        
+        # Convert back to int16
+        audio_int16 = (compressed * 32767).astype(np.int16)
+        
+        # Write back to WAV bytes
+        output_io = io.BytesIO()
+        wavfile.write(output_io, rate, audio_int16)
+        return output_io.getvalue()
+        
+    except Exception as e:
+        # If any error occurs, return original audio
+        print(f"Phone effect error: {e}")
+        return audio_bytes
+
+# ══════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════
 
@@ -266,8 +354,8 @@ def transcribe_audio(audio_bytes: bytes, content_type: str) -> str:
         Path(tmp_path).unlink(missing_ok=True)
 
 
-def synthesize_speech(text: str, voice_id: str) -> bytes:
-    """Synthesize text → WAV bytes via Cartesia."""
+def synthesize_speech(text: str, voice_id: str, add_phone_effects: bool = True) -> bytes:
+    """Synthesize text → WAV bytes via Cartesia with optional phone line effects."""
     payload = {
         "model_id":   CARTESIA_MODEL,
         "transcript": text,
@@ -275,7 +363,7 @@ def synthesize_speech(text: str, voice_id: str) -> bytes:
             "mode": "id", 
             "id": voice_id,
             "__experimental_controls": {
-                "speed": "slow",      # Options: "slowest", "slow", "normal", "fast", "fastest"
+                "speed": "normal",      # Changed from "slow" to "normal" for more natural pace
                 "emotion": []
             }
         },
@@ -296,7 +384,13 @@ def synthesize_speech(text: str, voice_id: str) -> bytes:
         timeout=20,
     )
     r.raise_for_status()
-    return r.content
+    audio_bytes = r.content
+    
+    # Add phone line effects
+    if add_phone_effects:
+        audio_bytes = add_phone_line_effects(audio_bytes, PLAYBACK_RATE)
+    
+    return audio_bytes
 
 
 def ai_customer_respond(session: dict, caller_text: str) -> str:
@@ -310,8 +404,9 @@ def ai_customer_respond(session: dict, caller_text: str) -> str:
         f"{profile['system_prompt']}\n\n"
         f"=== DIFFICULTY: {diff_conf['label'].upper()} ===\n"
         f"{diff_conf['guidance']}\n\n"
-        "Stay in character AT ALL TIMES. You are a REAL person. "
-        "Respond ONLY with what you would say. SHORT. 1-3 sentences max. "
+        "Stay in character AT ALL TIMES. You are a REAL person on the phone. "
+        "Respond ONLY with what you would say. Be conversational - not too short, not too long. "
+        "Vary your response length naturally based on the situation. "
         "Never reveal you are an AI or that this is training."
     )
 
@@ -321,11 +416,15 @@ def ai_customer_respond(session: dict, caller_text: str) -> str:
     r = requests.post(
         f"{GROQ_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json={"model": GROQ_MODEL, "max_tokens": 200, "messages": messages},
+        json={"model": GROQ_MODEL, "max_tokens": 300, "temperature": 0.8, "messages": messages},
         timeout=20,
     )
     r.raise_for_status()
     reply = r.json()["choices"][0]["message"]["content"].strip()
+    
+    # Clean up any accidental formatting
+    reply = reply.replace('*', '').replace('[', '').replace(']', '')
+    
     history.append({"role": "assistant", "content": reply})
     return reply
 
@@ -474,15 +573,15 @@ def create_session(req: SessionCreateRequest):
     # Get opening greeting from AI customer
     greeting = ai_customer_respond(
         session,
-        "[system] You just picked up the phone. Unknown number. Say only what you would actually say when picking up. One or two words max."
+        "[system] You just picked up the phone. Unknown number. Say what you would actually say when picking up. Be natural and conversational."
     )
     session["transcript"].append({
         "role": "customer", "text": greeting, "timestamp": time.time()
     })
 
-    # Synthesize opening audio
+    # Synthesize opening audio with phone effects
     try:
-        audio_bytes = synthesize_speech(greeting, voice_id)
+        audio_bytes = synthesize_speech(greeting, voice_id, add_phone_effects=True)
         audio_b64 = __import__("base64").b64encode(audio_bytes).decode()
     except Exception as e:
         audio_b64 = None
@@ -567,9 +666,9 @@ async def session_turn(
         "role": "customer", "text": response_text, "timestamp": time.time()
     })
 
-    # 4. Synthesize response audio
+    # 4. Synthesize response audio with phone effects
     try:
-        audio_bytes_out = synthesize_speech(response_text, session["voice_id"])
+        audio_bytes_out = synthesize_speech(response_text, session["voice_id"], add_phone_effects=True)
         response_audio_b64 = __import__("base64").b64encode(audio_bytes_out).decode()
     except Exception as e:
         response_audio_b64 = None
@@ -621,7 +720,7 @@ def session_turn_text(session_id: str, req: TextTurnRequest):
     })
 
     try:
-        audio_bytes = synthesize_speech(response_text, session["voice_id"])
+        audio_bytes = synthesize_speech(response_text, session["voice_id"], add_phone_effects=True)
         response_audio_b64 = __import__("base64").b64encode(audio_bytes).decode()
     except Exception:
         response_audio_b64 = None
