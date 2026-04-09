@@ -828,7 +828,12 @@ def delete_session(session_id: str):
 # ══════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════
+from fastapi.responses import FileResponse
 
+@app.get("/")
+async def serve_ui():
+    return FileResponse("telecaller_trainer.html")
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
