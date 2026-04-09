@@ -56,7 +56,7 @@ PLAYBACK_RATE     = 22050
 SESSIONS: dict[str, dict] = {}
 
 # ══════════════════════════════════════════════════════════════════════
-# CUSTOMER PROFILES - UPDATED FOR MORE NATURAL RESPONSES
+# CUSTOMER PROFILES
 # ══════════════════════════════════════════════════════════════════════
 
 CUSTOMER_PROFILES = [
@@ -200,7 +200,7 @@ app = FastAPI(title="Telecaller Training API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict to your domain in prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -265,48 +265,28 @@ def pick_voice(gender: str) -> str:
 # ══════════════════════════════════════════════════════════════════════
 
 def add_phone_line_effects(audio_bytes: bytes, sample_rate: int = 22050) -> bytes:
-    """
-    Add realistic phone line audio effects:
-    - Bandpass filter (300Hz - 3400Hz typical phone line)
-    - Light compression
-    - Background static noise
-    - Slight distortion
-    """
     if not SCIPY_AVAILABLE:
-        # If scipy not available, return original audio
         return audio_bytes
-    
     try:
-        # Parse WAV file
         audio_io = io.BytesIO(audio_bytes)
         rate, data = wavfile.read(audio_io)
-        
-        # Convert to float for processing
         if data.dtype == np.int16:
             audio_float = data.astype(np.float32) / 32768.0
         else:
             audio_float = data.astype(np.float32)
-        
-        # 1. Bandpass filter (300Hz - 3400Hz - typical phone bandwidth)
         nyquist = rate / 2
         low = 300 / nyquist
         high = 3400 / nyquist
         b, a = signal.butter(4, [low, high], btype='band')
         filtered = signal.filtfilt(b, a, audio_float)
-        
-        # 2. Add very light static noise (subtle)
-        noise_level = 0.002  # Very subtle
+        noise_level = 0.002
         noise = np.random.normal(0, noise_level, len(filtered))
         with_noise = filtered + noise
-        
-        # 3. Add occasional light crackle (sparse)
-        if random.random() < 0.3:  # 30% chance of light crackle
+        if random.random() < 0.3:
             crackle_positions = np.random.choice(len(with_noise), size=int(len(with_noise) * 0.001), replace=False)
             for pos in crackle_positions:
                 if pos < len(with_noise):
                     with_noise[pos] += random.uniform(-0.01, 0.01)
-        
-        # 4. Light compression (make quieter parts slightly louder)
         threshold = 0.3
         ratio = 3.0
         compressed = np.where(
@@ -314,22 +294,14 @@ def add_phone_line_effects(audio_bytes: bytes, sample_rate: int = 22050) -> byte
             np.sign(with_noise) * (threshold + (np.abs(with_noise) - threshold) / ratio),
             with_noise
         )
-        
-        # 5. Normalize to prevent clipping
         max_val = np.max(np.abs(compressed))
         if max_val > 0:
             compressed = compressed * 0.95 / max_val
-        
-        # Convert back to int16
         audio_int16 = (compressed * 32767).astype(np.int16)
-        
-        # Write back to WAV bytes
         output_io = io.BytesIO()
         wavfile.write(output_io, rate, audio_int16)
         return output_io.getvalue()
-        
     except Exception as e:
-        # If any error occurs, return original audio
         print(f"Phone effect error: {e}")
         return audio_bytes
 
@@ -337,21 +309,111 @@ def add_phone_line_effects(audio_bytes: bytes, sample_rate: int = 22050) -> byte
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════
 
+def detect_audio_extension(audio_bytes: bytes, content_type: str) -> str:
+    """
+    Detect the real audio format from magic bytes or content-type.
+    Returns the correct file extension so Whisper can decode it.
+    """
+    # Check magic bytes first (most reliable)
+    if audio_bytes[:4] == b'RIFF':
+        return '.wav'
+    if audio_bytes[:4] == b'fLaC':
+        return '.flac'
+    if audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+        return '.mp3'
+    if audio_bytes[:4] == b'OggS':
+        return '.ogg'
+    # WebM/MKV magic bytes
+    if audio_bytes[:4] == b'\x1a\x45\xdf\xa3':
+        return '.webm'
+    # MP4/M4A (ftyp box)
+    if len(audio_bytes) > 8 and audio_bytes[4:8] in (b'ftyp', b'moov', b'mdat'):
+        return '.mp4'
+
+    # Fall back to content-type
+    ct = (content_type or '').lower()
+    if 'webm' in ct:
+        return '.webm'
+    if 'ogg' in ct:
+        return '.ogg'
+    if 'mp4' in ct or 'm4a' in ct:
+        return '.mp4'
+    if 'mp3' in ct or 'mpeg' in ct:
+        return '.mp3'
+    if 'flac' in ct:
+        return '.flac'
+    if 'wav' in ct:
+        return '.wav'
+
+    # Default: treat as webm (most common from Chrome/Firefox MediaRecorder)
+    return '.webm'
+
+
 def transcribe_audio(audio_bytes: bytes, content_type: str) -> str:
-    """Transcribe audio bytes → text using Whisper."""
+    """
+    Transcribe audio bytes → text using Whisper.
+    Detects actual format and writes with correct extension so ffmpeg decodes correctly.
+    """
     model = get_whisper()
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+    ext = detect_audio_extension(audio_bytes, content_type)
+
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
         f.write(audio_bytes)
         tmp_path = f.name
+
     try:
         if _whisper_backend == "faster_whisper":
-            segments, _ = model.transcribe(tmp_path, language="en", beam_size=3, vad_filter=True)
-            return " ".join(s.text.strip() for s in segments).strip()
+            segments, info = model.transcribe(
+                tmp_path,
+                language="en",
+                beam_size=3,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 300}
+            )
+            text = " ".join(s.text.strip() for s in segments).strip()
         else:
             result = model.transcribe(tmp_path, language="en", fp16=False)
-            return result["text"].strip()
+            text = result["text"].strip()
+        return text
+    except Exception as e:
+        # If local whisper fails, try Groq Whisper API as fallback
+        print(f"Local whisper error: {e}, trying Groq Whisper API...")
+        return transcribe_via_groq(audio_bytes, ext)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+def transcribe_via_groq(audio_bytes: bytes, ext: str) -> str:
+    """
+    Fallback transcription via Groq's Whisper API endpoint.
+    This handles webm/mp4 reliably without needing local ffmpeg.
+    """
+    filename = f"audio{ext}"
+    mime_map = {
+        '.webm': 'audio/webm',
+        '.mp4':  'audio/mp4',
+        '.ogg':  'audio/ogg',
+        '.mp3':  'audio/mpeg',
+        '.wav':  'audio/wav',
+        '.flac': 'audio/flac',
+        '.m4a':  'audio/mp4',
+    }
+    mime = mime_map.get(ext, 'audio/webm')
+
+    try:
+        r = requests.post(
+            f"{GROQ_BASE_URL}/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": (filename, io.BytesIO(audio_bytes), mime)},
+            data={"model": "whisper-large-v3-turbo", "language": "en", "response_format": "text"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        # response_format=text returns plain text, not JSON
+        result = r.text.strip()
+        return result
+    except Exception as e:
+        raise RuntimeError(f"Groq transcription also failed: {e}")
 
 
 def synthesize_speech(text: str, voice_id: str, add_phone_effects: bool = True) -> bytes:
@@ -360,10 +422,10 @@ def synthesize_speech(text: str, voice_id: str, add_phone_effects: bool = True) 
         "model_id":   CARTESIA_MODEL,
         "transcript": text,
         "voice":      {
-            "mode": "id", 
+            "mode": "id",
             "id": voice_id,
             "__experimental_controls": {
-                "speed": "normal",      # Changed from "slow" to "normal" for more natural pace
+                "speed": "normal",
                 "emotion": []
             }
         },
@@ -385,11 +447,8 @@ def synthesize_speech(text: str, voice_id: str, add_phone_effects: bool = True) 
     )
     r.raise_for_status()
     audio_bytes = r.content
-    
-    # Add phone line effects
     if add_phone_effects:
         audio_bytes = add_phone_line_effects(audio_bytes, PLAYBACK_RATE)
-    
     return audio_bytes
 
 
@@ -421,10 +480,7 @@ def ai_customer_respond(session: dict, caller_text: str) -> str:
     )
     r.raise_for_status()
     reply = r.json()["choices"][0]["message"]["content"].strip()
-    
-    # Clean up any accidental formatting
     reply = reply.replace('*', '').replace('[', '').replace(']', '')
-    
     history.append({"role": "assistant", "content": reply})
     return reply
 
@@ -506,17 +562,20 @@ Respond ONLY with valid JSON:
     )
     r.raise_for_status()
     raw = r.json()["choices"][0]["message"]["content"].strip()
+    # Strip any markdown code fences
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
+        raw = raw.strip()
+    # Strip trailing ``` if present
+    if raw.endswith("```"):
+        raw = raw[:-3].strip()
     return json.loads(raw)
 
 # ══════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════
-
-# ── Health ─────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -526,17 +585,12 @@ def root():
 def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
-
-# ── Config endpoints ────────────────────────────────────────────────────
-
 @app.get("/profiles")
 def get_profiles():
-    """List all customer personality profiles."""
     return [{"id": p["id"], "name": p["name"], "description": p["description"], "gender": p["gender"]} for p in CUSTOMER_PROFILES]
 
 @app.get("/difficulties")
 def get_difficulties():
-    """List difficulty levels."""
     return [{"id": k, "label": v["label"], "emoji": v["emoji"]} for k, v in DIFFICULTY_CONFIGS.items()]
 
 
@@ -548,7 +602,6 @@ class SessionCreateRequest(BaseModel):
 
 @app.post("/session/create")
 def create_session(req: SessionCreateRequest):
-    """Create a new training session. Returns session_id + opening audio."""
     profile = next((p for p in CUSTOMER_PROFILES if p["id"] == req.profile_id), None)
     if not profile:
         raise HTTPException(404, f"Profile '{req.profile_id}' not found.")
@@ -563,14 +616,13 @@ def create_session(req: SessionCreateRequest):
         "profile":     profile,
         "difficulty":  req.difficulty,
         "voice_id":    voice_id,
-        "history":     [],           # AI customer convo history
-        "transcript":  [],           # full transcript [{role, text, timestamp}]
+        "history":     [],
+        "transcript":  [],
         "started_at":  time.time(),
-        "status":      "active",     # active | ended
+        "status":      "active",
     }
     SESSIONS[session_id] = session
 
-    # Get opening greeting from AI customer
     greeting = ai_customer_respond(
         session,
         "[system] You just picked up the phone. Unknown number. Say what you would actually say when picking up. Be natural and conversational."
@@ -579,7 +631,6 @@ def create_session(req: SessionCreateRequest):
         "role": "customer", "text": greeting, "timestamp": time.time()
     })
 
-    # Synthesize opening audio with phone effects
     try:
         audio_bytes = synthesize_speech(greeting, voice_id, add_phone_effects=True)
         audio_b64 = __import__("base64").b64encode(audio_bytes).decode()
@@ -587,29 +638,28 @@ def create_session(req: SessionCreateRequest):
         audio_b64 = None
 
     return {
-        "session_id":   session_id,
-        "profile":      {"id": profile["id"], "name": profile["name"], "description": profile["description"]},
-        "difficulty":   req.difficulty,
-        "voice_id":     voice_id,
-        "greeting_text": greeting,
-        "greeting_audio_b64": audio_b64,   # WAV base64
-        "audio_sample_rate": PLAYBACK_RATE,
+        "session_id":         session_id,
+        "profile":            {"id": profile["id"], "name": profile["name"], "description": profile["description"]},
+        "difficulty":         req.difficulty,
+        "voice_id":           voice_id,
+        "greeting_text":      greeting,
+        "greeting_audio_b64": audio_b64,
+        "audio_sample_rate":  PLAYBACK_RATE,
     }
 
 
 @app.get("/session/{session_id}")
 def get_session(session_id: str):
-    """Get session status and transcript."""
     session = SESSIONS.get(session_id)
     if not session:
         raise HTTPException(404, "Session not found.")
     return {
-        "session_id":  session_id,
-        "status":      session["status"],
-        "profile":     session["profile"]["name"],
-        "difficulty":  session["difficulty"],
-        "turns":       len([t for t in session["transcript"] if t["role"] == "telecaller"]),
-        "transcript":  session["transcript"],
+        "session_id":    session_id,
+        "status":        session["status"],
+        "profile":       session["profile"]["name"],
+        "difficulty":    session["difficulty"],
+        "turns":         len([t for t in session["transcript"] if t["role"] == "telecaller"]),
+        "transcript":    session["transcript"],
         "duration_secs": round(time.time() - session["started_at"], 1),
     }
 
@@ -623,30 +673,39 @@ async def session_turn(
 ):
     """
     Send telecaller audio → get customer response audio + text back.
-    
-    Upload: multipart/form-data with 'audio' field (WAV/WebM/MP3/etc)
-    Returns JSON with:
-      - transcription: what telecaller said
-      - response_text: what customer said
-      - response_audio_b64: WAV base64
-      - session_ended: bool (if end-of-call detected)
+    Supports webm, mp4, ogg, wav, mp3, flac — auto-detected from magic bytes.
     """
     session = SESSIONS.get(session_id)
     if not session:
         raise HTTPException(404, "Session not found.")
     if session["status"] == "ended":
-        raise HTTPException(400, "Session has already ended. Call /session/{id}/evaluate to get results.")
+        raise HTTPException(400, "Session has already ended.")
 
     audio_bytes = await audio.read()
 
-    # 1. Transcribe telecaller audio
+    if len(audio_bytes) < 500:
+        return {
+            "transcription": "",
+            "response_text": None,
+            "response_audio_b64": None,
+            "session_ended": False,
+            "note": "Audio too short or empty"
+        }
+
+    # 1. Transcribe — detects format automatically
     try:
-        caller_text = transcribe_audio(audio_bytes, audio.content_type or "audio/wav")
+        caller_text = transcribe_audio(audio_bytes, audio.content_type or "")
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {e}")
 
     if not caller_text.strip():
-        return {"transcription": "", "response_text": None, "response_audio_b64": None, "session_ended": False, "note": "No speech detected"}
+        return {
+            "transcription": "",
+            "response_text": None,
+            "response_audio_b64": None,
+            "session_ended": False,
+            "note": "No speech detected"
+        }
 
     session["transcript"].append({
         "role": "telecaller", "text": caller_text, "timestamp": time.time()
@@ -666,11 +725,11 @@ async def session_turn(
         "role": "customer", "text": response_text, "timestamp": time.time()
     })
 
-    # 4. Synthesize response audio with phone effects
+    # 4. Synthesize response audio
     try:
         audio_bytes_out = synthesize_speech(response_text, session["voice_id"], add_phone_effects=True)
         response_audio_b64 = __import__("base64").b64encode(audio_bytes_out).decode()
-    except Exception as e:
+    except Exception:
         response_audio_b64 = None
 
     if session_ended:
@@ -686,17 +745,13 @@ async def session_turn(
     }
 
 
-# ── Text-only turn (no audio hardware needed) ──────────────────────────
+# ── Text-only turn ─────────────────────────────────────────────────────
 
 class TextTurnRequest(BaseModel):
     text: str
 
 @app.post("/session/{session_id}/turn/text")
 def session_turn_text(session_id: str, req: TextTurnRequest):
-    """
-    Text-only turn — send telecaller text, get customer text + audio back.
-    Useful for testing or when browser mic is unavailable.
-    """
     session = SESSIONS.get(session_id)
     if not session:
         raise HTTPException(404, "Session not found.")
@@ -741,10 +796,6 @@ def session_turn_text(session_id: str, req: TextTurnRequest):
 
 @app.post("/session/{session_id}/evaluate")
 def evaluate(session_id: str):
-    """
-    End session and return detailed performance evaluation.
-    Can be called at any time — will also mark session as ended.
-    """
     session = SESSIONS.get(session_id)
     if not session:
         raise HTTPException(404, "Session not found.")
@@ -757,19 +808,18 @@ def evaluate(session_id: str):
         raise HTTPException(500, f"Evaluation failed: {e}")
 
     return {
-        "session_id":      session_id,
-        "customer":        session["profile"]["name"],
-        "difficulty":      session["difficulty"],
-        "duration_secs":   round(time.time() - session["started_at"], 1),
-        "total_turns":     len([t for t in session["transcript"] if t["role"] == "telecaller"]),
-        "transcript":      session["transcript"],
-        "evaluation":      result,
+        "session_id":    session_id,
+        "customer":      session["profile"]["name"],
+        "difficulty":    session["difficulty"],
+        "duration_secs": round(time.time() - session["started_at"], 1),
+        "total_turns":   len([t for t in session["transcript"] if t["role"] == "telecaller"]),
+        "transcript":    session["transcript"],
+        "evaluation":    result,
     }
 
 
 @app.delete("/session/{session_id}")
 def delete_session(session_id: str):
-    """Clean up a session from memory."""
     if session_id in SESSIONS:
         del SESSIONS[session_id]
     return {"deleted": True}
